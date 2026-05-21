@@ -6,8 +6,7 @@ import os
 load_dotenv()
 
 from app.database.db import engine, Base
-from app.models import user, patient, ecg_record, prediction, alert
-
+from app.models import user, patient, ecg_record, prediction, alert, token_blacklist
 # Importe le router d'authentification
 from app.routes import auth, users, patients,ecg,history,notifications
 Base.metadata.create_all(bind=engine)

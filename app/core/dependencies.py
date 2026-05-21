@@ -1,14 +1,11 @@
-# Ce fichier contient les "gardes de sécurité"
-# On les utilise dans chaque endpoint pour protéger les routes
-
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from app.database.db import get_db
 from app.models.user import User
+from app.models.token_blacklist import TokenBlacklist
 from app.core.security import decode_token
 
-# Dit à FastAPI où trouver le token (dans le header Authorization)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
@@ -16,7 +13,7 @@ def get_current_user(
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
 ) -> User:
-    """Vérifie le token et retourne l'utilisateur connecté"""
+    """Vérifie le token, vérifie la blacklist, retourne l'utilisateur"""
 
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -24,12 +21,23 @@ def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
 
-    # Décode le token
+    # 1. Vérifie si le token est blacklisté
+    blacklisted = db.query(TokenBlacklist).filter(
+        TokenBlacklist.token == token
+    ).first()
+    if blacklisted:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expirée — veuillez vous reconnecter",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 2. Décode le token
     payload = decode_token(token)
     if payload is None:
         raise credentials_exception
 
-    # Récupère l'utilisateur depuis la base
+    # 3. Récupère l'utilisateur
     user_id = payload.get("sub")
     if user_id is None:
         raise credentials_exception
