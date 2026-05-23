@@ -1,20 +1,37 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import os
+import asyncio
 
 load_dotenv()
 
 from app.database.db import engine, Base
 from app.models import user, patient, ecg_record, prediction, alert, token_blacklist
-# Importe le router d'authentification
-from app.routes import auth, users, patients,ecg,history,notifications
+from app.models import mri_scan, digital_twin, treatment_simulation, medical_note
+from app.routes import auth, users, patients, ecg, history, notifications
+from app.routes import digital_twin as digital_twin_router
+from app.routes import websocket
+from app.websocket.manager import manager
+from app.services.mqtt_service import mqtt_service
+
 Base.metadata.create_all(bind=engine)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Démarrage
+    loop = asyncio.get_event_loop()
+    mqtt_service.start(manager, loop)
+    yield
+    # Arrêt
+    mqtt_service.stop()
 
 app = FastAPI(
     title="CardioAI API",
     description="Plateforme de monitoring cardiaque",
     version="1.0.0",
+    lifespan=lifespan
 )
 
 origins = [
@@ -29,13 +46,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Connecte le router auth à l'application
 app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(patients.router)
 app.include_router(ecg.router)
 app.include_router(history.router)
 app.include_router(notifications.router)
+app.include_router(digital_twin_router.router)
+app.include_router(websocket.router)
+
 @app.get("/")
 def root():
     return {"message": "CardioAI API is running!"}

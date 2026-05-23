@@ -2,11 +2,10 @@ from pydantic import BaseModel
 from typing import Optional
 
 class CreatePatientRequest(BaseModel):
-    """Ce que le médecin envoie pour créer un patient"""
     first_name: str
     last_name: str
     age: int
-    gender: str          # 'M' ou 'F'
+    gender: str
     height: Optional[float] = None
     weight: Optional[float] = None
     medical_history: Optional[str] = None
@@ -14,11 +13,10 @@ class CreatePatientRequest(BaseModel):
     has_hypertension: bool = False
     has_vascular_disease: bool = False
     previous_stroke: bool = False
-    email: str           # email de login du patient
-    password: str        # mot de passe du patient
+    email: str
+    password: str
 
 class PatientResponse(BaseModel):
-    """Ce que le backend renvoie"""
     id: int
     age: int
     gender: str
@@ -26,6 +24,10 @@ class PatientResponse(BaseModel):
     has_hypertension: bool
     has_vascular_disease: bool
     previous_stroke: bool
+    # Infos du compte user
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
 
     class Config:
         from_attributes = True

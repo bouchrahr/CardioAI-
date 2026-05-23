@@ -58,13 +58,32 @@ def create_patient(
 @router.get("/", response_model=list[PatientResponse])
 def get_patients(
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_doctor)  # ← seulement médecin
+    current_user: User = Depends(require_doctor)
 ):
     """Le médecin voit SEULEMENT ses propres patients"""
     patients = db.query(Patient).filter(
-        Patient.doctor_id == current_user.id  # ← filtre par médecin connecté
+        Patient.doctor_id == current_user.id
     ).all()
-    return patients
+
+    result = []
+    for patient in patients:
+        # Récupère le compte user du patient
+        user = db.query(User).filter(User.id == patient.user_id).first()
+        patient_data = {
+            "id": patient.id,
+            "age": patient.age,
+            "gender": patient.gender,
+            "has_diabetes": patient.has_diabetes,
+            "has_hypertension": patient.has_hypertension,
+            "has_vascular_disease": patient.has_vascular_disease,
+            "previous_stroke": patient.previous_stroke,
+            "first_name": user.first_name if user else None,
+            "last_name": user.last_name if user else None,
+            "email": user.email if user else None,
+        }
+        result.append(patient_data)
+
+    return result
 
 
 @router.get("/{patient_id}", response_model=PatientResponse)
@@ -83,3 +102,88 @@ def get_patient(
         raise HTTPException(status_code=404, detail="Patient non trouvé")
 
     return patient
+
+@router.put("/{patient_id}")
+def update_patient(
+    patient_id: int,
+    request: CreatePatientRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_doctor)
+):
+    """Le médecin modifie un patient"""
+
+    # Vérifie que le patient appartient à ce médecin
+    patient = db.query(Patient).filter(
+        Patient.id == patient_id,
+        Patient.doctor_id == current_user.id
+    ).first()
+
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient non trouvé")
+
+    # Met à jour les informations
+    patient.age = request.age
+    patient.gender = request.gender
+    patient.height = request.height
+    patient.weight = request.weight
+    patient.medical_history = request.medical_history
+    patient.has_diabetes = request.has_diabetes
+    patient.has_hypertension = request.has_hypertension
+    patient.has_vascular_disease = request.has_vascular_disease
+    patient.previous_stroke = request.previous_stroke
+
+    db.commit()
+    db.refresh(patient)
+    return patient
+
+
+@router.delete("/{patient_id}")
+def delete_patient(
+    patient_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_doctor)
+):
+    """Le médecin supprime un patient et toutes ses données"""
+    from app.models.ecg_record import ECGRecord
+    from app.models.prediction import Prediction
+    from app.models.alert import Alert
+
+    # Vérifie que le patient appartient à ce médecin
+    patient = db.query(Patient).filter(
+        Patient.id == patient_id,
+        Patient.doctor_id == current_user.id
+    ).first()
+
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient non trouvé")
+
+    # 1. Supprime les alertes du patient
+    db.query(Alert).filter(Alert.patient_id == patient_id).delete()
+
+    # 2. Supprime les prédictions liées aux ECG du patient
+    ecg_records = db.query(ECGRecord).filter(
+        ECGRecord.patient_id == patient_id
+    ).all()
+    for ecg in ecg_records:
+        db.query(Prediction).filter(
+            Prediction.ecg_record_id == ecg.id
+        ).delete()
+
+    # 3. Supprime les ECG records
+    db.query(ECGRecord).filter(
+        ECGRecord.patient_id == patient_id
+    ).delete()
+
+    # 4. Supprime le patient
+    db.delete(patient)
+    db.commit()
+
+    # 5. Supprime aussi le compte login du patient
+    user = db.query(User).filter(User.id == patient.user_id).first()
+    if user:
+        db.delete(user)
+        db.commit()
+
+    return {"message": "Patient et toutes ses données supprimés avec succès"}
+    
+    return {"message": "Patient et toutes ses données supprimés avec succès"}
