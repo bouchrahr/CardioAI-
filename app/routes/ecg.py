@@ -6,11 +6,13 @@ from app.models.ecg_record import ECGRecord
 from app.models.prediction import Prediction
 from app.models.patient import Patient
 from app.models.alert import Alert
-from app.services.ai_service import predict_ecg, calculate_chadsvasc
+from app.services.ai_service import predict_ecg
+from app.services.risk_engine import calculate_chadsvasc
 from app.services.llm_service import generate_medical_report
 from app.core.dependencies import require_doctor
 import os
 import shutil
+import numpy as np
 
 router = APIRouter(prefix="/api/ecg", tags=["ECG"])
 
@@ -23,12 +25,12 @@ def upload_ecg(
     patient_id: int,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_doctor)  # ← seulement médecin
+    current_user: User = Depends(require_doctor)
 ):
     # 1. Vérifie que le patient appartient à CE médecin
     patient = db.query(Patient).filter(
         Patient.id == patient_id,
-        Patient.doctor_id == current_user.id  # ← sécurité !
+        Patient.doctor_id == current_user.id
     ).first()
     if not patient:
         raise HTTPException(status_code=404, detail="Patient non trouvé")
@@ -50,8 +52,14 @@ def upload_ecg(
     db.commit()
     db.refresh(ecg_record)
 
-    # 4. Analyse ECG avec l'IA
-    ecg_result = predict_ecg(None)
+    # 4. Lire le fichier ECG et analyser avec le vrai modèle
+    ecg_signal = []
+    with open(file_path, 'r') as f:
+        for line in f:
+            values = [float(v) for v in line.strip().split(',') if v.strip()]
+            ecg_signal.extend(values)
+
+    ecg_result = predict_ecg(ecg_signal, source_hz=100)
 
     # 5. Calcule le score CHADS-VASc
     risk_data = calculate_chadsvasc(
@@ -100,7 +108,7 @@ def upload_ecg(
             doctor_id=current_user.id,
             alert_type='AFib_Detected' if ecg_result['predicted_class'] == 'AFib' else 'Critical_Risk',
             severity='Critical' if risk_data['risk_level'] == 'Critique' else 'High',
-            message=f"Patient {patient_id} — {ecg_result['predicted_class']} détecté. Score CHADS-VASc: {risk_data['chadsvasc_score']}/9",
+            message=f"Patient {patient_id} — {ecg_result['predicted_class']} detecte. Score CHADS-VASc: {risk_data['chadsvasc_score']}/9",
             is_read=False,
             email_sent=False
         )
@@ -130,12 +138,10 @@ def get_ecg(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_doctor)
 ):
-    """Détails d'un enregistrement ECG avec sa prédiction"""
     record = db.query(ECGRecord).filter(
         ECGRecord.id == ecg_id,
         ECGRecord.doctor_id == current_user.id
     ).first()
-
     if not record:
         raise HTTPException(status_code=404, detail="Enregistrement non trouvé")
 

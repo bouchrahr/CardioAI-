@@ -1,73 +1,90 @@
-# Ce fichier contient la logique IA
-# Pour l'instant on utilise des réponses MOCK (fausses)
-# Plus tard on remplacera par le vrai modèle InceptionTime
-
 import numpy as np
-import random
+import torch
+import os
+from scipy.signal import resample, butter, sosfilt
+from app.services.inception_model import InceptionTimeSE
 
-def predict_ecg(ecg_data):
-    """
-    Analyse le signal ECG et retourne une prédiction.
-    MOCK pour l'instant — sera remplacé par InceptionTime
-    """
-    classes = ['Normal', 'AFib', 'Other']
-    predicted = random.choice(classes)
-    confidence = random.uniform(0.75, 0.99)
+MODEL_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "../../models/best_InceptionTimeSE_4class.pth"
+)
+CLASS_NAMES = ['Normal', 'AFib', 'PVC', 'Other']
 
-    return {
-        "predicted_class": predicted,
-        "confidence": round(confidence, 3),
-        "probabilities": {
-            "Normal": round(random.uniform(0.01, 0.2), 3),
-            "AFib": round(confidence if predicted == 'AFib' else random.uniform(0.01, 0.1), 3),
-            "Other": round(random.uniform(0.01, 0.1), 3)
-        },
-        "attention_map": [round(random.uniform(0, 1), 3) for _ in range(100)]
-    }
+_model = None
+
+def load_model():
+    global _model
+    if _model is None:
+        print("Chargement InceptionTime+SE...")
+        model = InceptionTimeSE(num_classes=4)
+        state = torch.load(MODEL_PATH, map_location='cpu')
+        if 'model_state_dict' in state:
+            state = state['model_state_dict']
+        model.load_state_dict(state)
+        model.eval()
+        _model = model
+        print("Modele InceptionTime+SE charge !")
+    return _model
 
 
-def calculate_chadsvasc(age, gender, has_diabetes, has_hypertension,
-                         has_vascular_disease, previous_stroke, ecg_class):
-    """
-    Calcule le score CHADS-VASc réel basé sur les guidelines ESC 2023
-    """
-    score = 0
+def bandpass_filter(ecg, lowcut=0.5, highcut=40.0, fs=100, order=4):
+    nyq = fs / 2
+    sos = butter(order, [lowcut / nyq, highcut / nyq], btype='band', output='sos')
+    return sosfilt(sos, ecg)
 
-    if has_hypertension:     score += 1
-    if age >= 75:            score += 2
-    elif age >= 65:          score += 1
-    if has_diabetes:         score += 1
-    if previous_stroke:      score += 2
-    if has_vascular_disease: score += 1
-    if gender == 'F':        score += 1
 
-    # Niveau de risque
-    if score == 0:   risk_level = 'Faible'
-    elif score == 1: risk_level = 'Modéré'
-    elif score == 2: risk_level = 'Élevé'
-    else:            risk_level = 'Critique'
+def preprocess_ecg(signal: list, source_hz: int = 500) -> torch.Tensor:
+    sig = np.array(signal, dtype=np.float32)
 
-    # Risque immédiat basé sur l'ECG
-    if ecg_class == 'AFib' and score >= 2:
-        risk_immediate = 'Critique'
-    elif ecg_class == 'AFib':
-        risk_immediate = 'Urgent'
-    elif ecg_class == 'Other':
-        risk_immediate = 'Attention'
+    # 1. Resample vers 100Hz/1000 points si la source n'est pas déjà à 100Hz
+    if source_hz != 100:
+        sig = resample(sig, 1000)
+
+    # 2. Padding/troncature à exactement 1000 points (sécurité)
+    if len(sig) < 1000:
+        sig = np.pad(sig, (0, 1000 - len(sig)))
     else:
-        risk_immediate = 'Stable'
+        sig = sig[:1000]
 
-    # Risque AVC à 12 mois (ESC 2023)
-    risk_table = {
-        0: 0.0, 1: 1.3, 2: 2.2, 3: 3.2,
-        4: 4.0, 5: 6.7, 6: 9.8, 7: 9.6,
-        8: 6.7, 9: 15.2
-    }
-    avc_risk = risk_table.get(min(score, 9), 15.2)
+    # 3. Filtre passe-bande Butterworth 0.5-40Hz (identique au notebook Kaggle)
+    sig = bandpass_filter(sig, lowcut=0.5, highcut=40.0, fs=100, order=4)
 
-    return {
-        "chadsvasc_score": score,
-        "risk_level": risk_level,
-        "risk_immediate": risk_immediate,
-        "avc_risk_12m": avc_risk
-    }
+    # 4. Normalisation Z-score sur le signal FILTRÉ (pas le signal brut)
+    std = sig.std()
+    if std > 1e-8:
+        sig = (sig - sig.mean()) / std
+    else:
+        sig = sig - sig.mean()
+
+    # 5. Clipping [-5, 5] (identique au notebook, pas [-3, 3])
+    sig = np.clip(sig, -5, 5).astype(np.float32)
+
+    return torch.FloatTensor(sig).unsqueeze(0).unsqueeze(0)
+
+def predict_ecg(ecg_signal: list, source_hz: int = 500) -> dict:
+    try:
+        model = load_model()
+        x = preprocess_ecg(ecg_signal, source_hz)
+        with torch.no_grad():
+            out = model(x)
+            probs = torch.softmax(out, dim=1).squeeze().tolist()
+        pred_idx = int(np.argmax(probs))
+        return {
+            "predicted_class": CLASS_NAMES[pred_idx],
+            "predicted_idx": pred_idx,
+            "confidence": round(probs[pred_idx], 3),
+            "probabilities": {
+                CLASS_NAMES[i]: round(probs[i], 3) for i in range(4)
+            },
+            "attention_map": [round(float(v), 3) for v in np.linspace(0, 1, 100)]
+        }
+    except Exception as e:
+        print(f"Erreur inference ECG: {e}")
+        return {
+            "predicted_class": "Normal",
+            "predicted_idx": 0,
+            "confidence": 0.0,
+            "probabilities": {"Normal": 1.0, "AFib": 0.0, "PVC": 0.0, "Other": 0.0},
+            "attention_map": [0.0] * 100,
+            "error": str(e)
+        }

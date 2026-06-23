@@ -18,3 +18,8 @@ uploads/
 # IDE
 .vscode/
 .idea/
+# Donnees et modeles lourds (pas sur GitHub)
+models/
+test_data/
+*.npy
+*.pth
