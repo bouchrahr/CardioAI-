@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
 from sqlalchemy.sql import func
 from app.database.db import Base
 
+
 class ECGRecord(Base):
     __tablename__ = "ecg_records"
 
@@ -12,3 +13,4 @@ class ECGRecord(Base):
     file_path  = Column(String)
     duration   = Column(Float)
     source     = Column(String)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

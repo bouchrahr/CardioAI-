@@ -1,6 +1,8 @@
 from pydantic import BaseModel, EmailStr
 from typing import Optional
 
+from typing import Optional
+
 class LoginRequest(BaseModel):
     """Ce que le frontend envoie pour se connecter"""
     email: EmailStr
@@ -32,3 +34,11 @@ class LoginResponse(BaseModel):
     token_type: str
     role: str
     user: dict       
+
+
+
+class UpdateUserRequest(BaseModel):
+    email: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    password: Optional[str] = None

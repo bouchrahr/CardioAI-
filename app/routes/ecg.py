@@ -10,6 +10,9 @@ from app.services.ai_service import predict_ecg
 from app.services.risk_engine import calculate_chadsvasc
 from app.services.llm_service import generate_medical_report
 from app.core.dependencies import require_doctor
+
+
+from app.services.logging_service import log_action
 import os
 import shutil
 import numpy as np
@@ -114,7 +117,16 @@ def upload_ecg(
         )
         db.add(alert)
         db.commit()
+   
 
+   
+# Log de l'action (après tout le pipeline, sans planter même si ça échoue)
+    log_action(
+        db=db,
+        action="ECG_UPLOAD",
+        user_email=current_user.email,
+        user_role=current_user.role,
+        details=f"Analyse ECG patient #{patient_id} → {ecg_result['predicted_class']} (confiance {ecg_result['confidence']}, risque {risk_data['risk_level']})",    )
     # 9. Retourne le résultat complet
     return {
         "ecg_record_id": ecg_record.id,
