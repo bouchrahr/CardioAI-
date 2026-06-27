@@ -9,12 +9,13 @@ load_dotenv()
 
 from app.database.db import engine, Base
 from app.models import user, patient, ecg_record, prediction, alert, token_blacklist
-from app.models import mri_scan, digital_twin, treatment_simulation, medical_note
+from app.models import log, mri_scan, digital_twin, treatment_simulation, medical_note
 from app.routes import auth, users, patients, ecg, history, notifications
 from app.routes import digital_twin as digital_twin_router
 from app.routes import websocket
 from app.websocket.manager import manager
 from app.services.mqtt_service import mqtt_service
+from app.routes import logs as logs_router
 
 Base.metadata.create_all(bind=engine)
 
@@ -54,6 +55,7 @@ app.include_router(history.router)
 app.include_router(notifications.router)
 app.include_router(digital_twin_router.router)
 app.include_router(websocket.router)
+app.include_router(logs_router.router)
 
 @app.get("/")
 def root():

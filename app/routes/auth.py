@@ -6,13 +6,15 @@ from app.models.token_blacklist import TokenBlacklist
 from app.schemas.user import LoginRequest, LoginResponse
 from app.core.security import verify_password, create_access_token
 from app.core.dependencies import get_current_user, oauth2_scheme
-
+from app.services.logging_service import log_action
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 
 @router.post("/login")
 def login(request: LoginRequest, db: Session = Depends(get_db)):
     """Login — retourne un token JWT"""
+  
+
 
     # 1. Cherche l'utilisateur par email
     user = db.query(User).filter(User.email == request.email).first()
@@ -27,12 +29,23 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Compte désactivé")
 
+        
+
     # 4. Crée le token JWT
     token = create_access_token(data={
         "sub": str(user.id),
         "role": user.role,
         "email": user.email
     })
+
+     
+    log_action(
+    db=db,
+    action="LOGIN",
+    user_email=user.email,
+    user_role=user.role,
+    details=f"Connexion {user.role}",
+)    
 
     return {
         "access_token": token,
@@ -59,6 +72,15 @@ def logout(
     blacklisted_token = TokenBlacklist(token=token)
     db.add(blacklisted_token)
     db.commit()
+
+    log_action(
+    db=db,
+    action="LOGOUT",
+    user_email=current_user.email,
+    user_role=current_user.role,
+    details="Déconnexion",
+)
+
 
     return {"message": f"Au revoir {current_user.first_name} — session terminée"}
 
