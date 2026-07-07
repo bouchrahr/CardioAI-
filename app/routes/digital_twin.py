@@ -8,16 +8,19 @@ from app.models.treatment_simulation import TreatmentSimulation
 from app.models.medical_note import MedicalNote
 from app.models.patient import Patient
 from app.schemas.digital_twin import (
-    MRIScanCreate, MRIScanResponse,
     DigitalTwinCreate, DigitalTwinResponse,
+    MRIScanResponse, MRIAnalysisResponse,
     TreatmentSimulationCreate, TreatmentSimulationResponse,
     MedicalNoteCreate, MedicalNoteResponse
 )
-import os, shutil
+from app.services.mri_service import mri_service, analyze_mri_pair
+import os
+import shutil
 from datetime import datetime
 from typing import List
 
 router = APIRouter(prefix="/api/cdt", tags=["Digital Twin"])
+
 
 def get_db():
     db = SessionLocal()
@@ -26,21 +29,46 @@ def get_db():
     finally:
         db.close()
 
+
+def _validate_nii(file: UploadFile):
+    """Vérifie qu'un fichier est bien un NIfTI .nii ou .nii.gz."""
+    name = (file.filename or "").lower()
+    if not (name.endswith(".nii") or name.endswith(".nii.gz")):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Format non supporté pour '{file.filename}'. Attendu : .nii ou .nii.gz"
+        )
+
+
+def _save_upload(file: UploadFile, dest_path: str) -> float:
+    """Sauvegarde un UploadFile sur disque, retourne la taille en MB."""
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    with open(dest_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    return round(os.path.getsize(dest_path) / (1024 * 1024), 2)
+
+
 # ─────────────────────────────────────────
-# ENDPOINT 1 — Uploader une IRM
+# ENDPOINT 1 — Uploader une IRM (ED + ES) et générer le Digital Twin
 # ─────────────────────────────────────────
 
-@router.post("/upload-mri/{patient_id}", response_model=MRIScanResponse)
-def upload_mri(
+@router.post("/upload-mri/{patient_id}", response_model=MRIAnalysisResponse)
+def upload_mri_and_analyze(
     patient_id: int,
-    file: UploadFile = File(...),
-    scan_date: str = None,
-    scanner_type: str = None,
-    notes: str = None,
+    ed_file: UploadFile = File(..., description="Frame End-Diastole (.nii.gz)"),
+    es_file: UploadFile = File(..., description="Frame End-Systole (.nii.gz)"),
     db: Session = Depends(get_db),
     current_user=Depends(require_doctor)
 ):
-    # Vérifier que le patient appartient au médecin
+    """
+    Uploade une paire IRM (ED + ES), lance la segmentation nnU-Net sur chaque
+    frame, calcule les volumes cardiaques et l'Ejection Fraction, puis crée
+    un DigitalTwin complet.
+
+    ATTENTION : sur CPU, l'inférence des 2 frames prend ~20-60 secondes.
+    La requête est synchrone (pas de file d'attente dans cette version).
+    """
+    # 1. Vérifier que le patient appartient au médecin
     patient = db.query(Patient).filter(
         Patient.id == patient_id,
         Patient.doctor_id == current_user.id
@@ -48,45 +76,124 @@ def upload_mri(
     if not patient:
         raise HTTPException(status_code=404, detail="Patient non trouvé")
 
-    # Vérifier le format du fichier
-    allowed = [".dcm", ".nii", ".nii.gz", ".zip"]
-    ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in allowed:
+    # 2. Vérifier la disponibilité du modèle
+    if not mri_service.is_available:
         raise HTTPException(
-            status_code=400,
-            detail=f"Format non supporté. Formats acceptés : {allowed}"
+            status_code=503,
+            detail="Le modèle de segmentation IRM n'est pas disponible sur le serveur."
         )
 
-    # Sauvegarder le fichier
+    # 3. Valider les formats
+    _validate_nii(ed_file)
+    _validate_nii(es_file)
+
+    # 4. Sauvegarder les fichiers d'origine
     upload_dir = f"uploads/mri/{patient_id}"
-    os.makedirs(upload_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_path = f"{upload_dir}/{timestamp}_{file.filename}"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ed_path = f"{upload_dir}/{ts}_ED.nii.gz"
+    es_path = f"{upload_dir}/{ts}_ES.nii.gz"
+    ed_size = _save_upload(ed_file, ed_path)
+    es_size = _save_upload(es_file, es_path)
 
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    # Chemins de sortie pour les masques prédits
+    ed_seg_path = f"{upload_dir}/{ts}_ED_seg.nii.gz"
+    es_seg_path = f"{upload_dir}/{ts}_ES_seg.nii.gz"
 
-    file_size = os.path.getsize(file_path) / (1024 * 1024)  # en MB
+    # 5. Lancer l'analyse nnU-Net (ED + ES)
+    try:
+        result = analyze_mri_pair(
+            ed_path=ed_path,
+            es_path=es_path,
+            ed_seg_out=ed_seg_path,
+            es_seg_out=es_seg_path,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur d'analyse IRM : {e}")
 
-    # Sauvegarder dans la DB
-    mri = MRIScan(
+    ed_data = result["ed"]
+    es_data = result["es"]
+    clinical = result["clinical"]
+
+    # 6. Créer les 2 MRIScans (ED et ES)
+    mri_ed = MRIScan(
         patient_id=patient_id,
         doctor_id=current_user.id,
-        file_path=file_path,
-        file_format=ext.replace(".", ""),
-        file_size_mb=round(file_size, 2),
-        scan_date=datetime.fromisoformat(scan_date) if scan_date else None,
-        scanner_type=scanner_type,
-        notes=notes,
-        status="pending"
+        file_path=ed_path,
+        file_format="nii.gz",
+        file_size_mb=ed_size,
+        frame_type="ED",
+        status="completed",
+        segmentation_path=ed_data["seg_path"],
+        lv_volume_ml=ed_data["lv_volume_ml"],
+        rv_volume_ml=ed_data["rv_volume_ml"],
+        myocardium_mass_g=ed_data["myocardium_mass_g"],
+        voxel_spacing=ed_data["spacing"],
     )
-    db.add(mri)
+    mri_es = MRIScan(
+        patient_id=patient_id,
+        doctor_id=current_user.id,
+        file_path=es_path,
+        file_format="nii.gz",
+        file_size_mb=es_size,
+        frame_type="ES",
+        status="completed",
+        segmentation_path=es_data["seg_path"],
+        lv_volume_ml=es_data["lv_volume_ml"],
+        rv_volume_ml=es_data["rv_volume_ml"],
+        myocardium_mass_g=es_data["myocardium_mass_g"],
+        voxel_spacing=es_data["spacing"],
+    )
+    db.add(mri_ed)
+    db.add(mri_es)
     db.commit()
-    db.refresh(mri)
-    return mri
+    db.refresh(mri_ed)
+    db.refresh(mri_es)
+
+    # 7. Désactiver l'ancien twin actif du patient
+    db.query(DigitalTwin).filter(
+        DigitalTwin.patient_id == patient_id,
+        DigitalTwin.is_active == True
+    ).update({"is_active": False})
+
+    # 8. Créer le DigitalTwin
+    twin = DigitalTwin(
+        patient_id=patient_id,
+        doctor_id=current_user.id,
+        mri_scan_ed_id=mri_ed.id,
+        mri_scan_es_id=mri_es.id,
+        status="ready",
+        edv_ml=clinical["edv_ml"],
+        esv_ml=clinical["esv_ml"],
+        stroke_volume_ml=clinical["stroke_volume_ml"],
+        ejection_fraction=clinical["ejection_fraction"],
+        myocardium_mass_g=clinical["myocardium_mass_g"],
+        rv_edv_ml=clinical["rv_edv_ml"],
+        clinical_status=clinical["clinical_status"],
+        segmentation_meta={
+            "ed_slices": ed_data["n_slices"],
+            "es_slices": es_data["n_slices"],
+            "ed_spacing": ed_data["spacing"],
+            "es_spacing": es_data["spacing"],
+        },
+        is_active=True,
+    )
+    db.add(twin)
+    db.commit()
+    db.refresh(twin)
+
+    return MRIAnalysisResponse(
+        digital_twin=twin,
+        mri_scan_ed=mri_ed,
+        mri_scan_es=mri_es,
+        message=(
+            f"Analyse terminée. EF = {clinical['ejection_fraction']}% "
+            f"({clinical['clinical_status']})."
+        ),
+    )
+
 
 # ─────────────────────────────────────────
-# ENDPOINT 2 — Créer un Digital Twin
+# ENDPOINT 2 — Créer un Digital Twin manuellement (à partir de scans existants)
 # ─────────────────────────────────────────
 
 @router.post("/create/{patient_id}", response_model=DigitalTwinResponse)
@@ -96,7 +203,6 @@ def create_digital_twin(
     db: Session = Depends(get_db),
     current_user=Depends(require_doctor)
 ):
-    # Vérifier que le patient appartient au médecin
     patient = db.query(Patient).filter(
         Patient.id == patient_id,
         Patient.doctor_id == current_user.id
@@ -104,17 +210,16 @@ def create_digital_twin(
     if not patient:
         raise HTTPException(status_code=404, detail="Patient non trouvé")
 
-    # Désactiver l'ancien twin s'il existe
     db.query(DigitalTwin).filter(
         DigitalTwin.patient_id == patient_id,
         DigitalTwin.is_active == True
     ).update({"is_active": False})
 
-    # Créer le nouveau twin
     twin = DigitalTwin(
         patient_id=patient_id,
         doctor_id=current_user.id,
-        mri_scan_id=data.mri_scan_id,
+        mri_scan_ed_id=data.mri_scan_ed_id,
+        mri_scan_es_id=data.mri_scan_es_id,
         ecg_record_id=data.ecg_record_id,
         status="building",
         is_active=True
@@ -123,6 +228,7 @@ def create_digital_twin(
     db.commit()
     db.refresh(twin)
     return twin
+
 
 # ─────────────────────────────────────────
 # ENDPOINT 3 — Récupérer le Digital Twin actif
@@ -142,8 +248,9 @@ def get_latest_twin(
         raise HTTPException(status_code=404, detail="Aucun Digital Twin trouvé pour ce patient")
     return twin
 
+
 # ─────────────────────────────────────────
-# ENDPOINT 4 — Simuler un traitement
+# ENDPOINT 4 — Simuler un traitement (MOCK, inchangé)
 # ─────────────────────────────────────────
 
 @router.post("/simulate/{twin_id}", response_model=TreatmentSimulationResponse)
@@ -153,7 +260,6 @@ def simulate_treatment(
     db: Session = Depends(get_db),
     current_user=Depends(require_doctor)
 ):
-    # Vérifier que le twin existe
     twin = db.query(DigitalTwin).filter(
         DigitalTwin.id == twin_id,
         DigitalTwin.doctor_id == current_user.id
@@ -161,14 +267,12 @@ def simulate_treatment(
     if not twin:
         raise HTTPException(status_code=404, detail="Digital Twin non trouvé")
 
-    # Créer la simulation (résultats MOCK pour l'instant)
     simulation = TreatmentSimulation(
         digital_twin_id=twin_id,
         doctor_id=current_user.id,
         treatment_type=data.treatment_type,
         treatment_params=data.treatment_params,
         status="completed",
-        # Valeurs mock — à remplacer par le vrai modèle LSTM plus tard
         predicted_improvement=72.5,
         avc_risk_reduction=45.0,
         side_effects_risk=12.3,
@@ -178,6 +282,7 @@ def simulate_treatment(
     db.commit()
     db.refresh(simulation)
     return simulation
+
 
 # ─────────────────────────────────────────
 # ENDPOINT 5 — Ajouter une note médicale
@@ -210,6 +315,7 @@ def add_medical_note(
     db.commit()
     db.refresh(note)
     return note
+
 
 # ─────────────────────────────────────────
 # ENDPOINT 6 — Récupérer les notes d'un patient

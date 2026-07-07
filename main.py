@@ -15,18 +15,28 @@ from app.routes import digital_twin as digital_twin_router
 from app.routes import websocket
 from app.websocket.manager import manager
 from app.services.mqtt_service import mqtt_service
+from app.services.mri_service import mri_service
 from app.routes import logs as logs_router
 
 Base.metadata.create_all(bind=engine)
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Démarrage
+    # ── Démarrage ──────────────────────────────────────────────
+    # 1. Pipeline temps réel MQTT
     loop = asyncio.get_event_loop()
     mqtt_service.start(manager, loop)
+
+    # 2. Modèle nnU-Net IRM (chargé une seule fois, dans un thread pour
+    #    ne pas bloquer le démarrage du serveur — le chargement CPU prend qq secondes)
+    await asyncio.to_thread(mri_service.load_model)
+
     yield
-    # Arrêt
+
+    # ── Arrêt ──────────────────────────────────────────────────
     mqtt_service.stop()
+
 
 app = FastAPI(
     title="CardioAI API",
@@ -56,6 +66,7 @@ app.include_router(notifications.router)
 app.include_router(digital_twin_router.router)
 app.include_router(websocket.router)
 app.include_router(logs_router.router)
+
 
 @app.get("/")
 def root():
