@@ -8,8 +8,10 @@ Architecture :
        predict_ecg -> calculate_chadsvasc
        -> ECGRecord + Prediction en DB
        -> Alert si risque ≥ Modéré
+         -> Email au médecin (Brevo, cooldown 5min, non-bloquant)
+         -> Push WebSocket au médecin (/api/ws, canal "notifications" — cloche/toast/son)
        -> log_action("ECG_AUTO_ANALYSIS")
-       -> forward du résultat via WebSocket vers le frontend
+       -> forward du résultat via WebSocket ECG vers le frontend
 
 NOTE THREADING : paho-mqtt utilise UN seul thread pour tous les callbacks
 on_message. Donc le buffer Python (dict) n'a pas besoin de Lock — un seul
@@ -30,11 +32,14 @@ import numpy as np
 from app.database.db import SessionLocal
 from app.models.patient import Patient
 from app.models.ecg_record import ECGRecord
+from app.models.user import User
 from app.models.prediction import Prediction
 from app.models.alert import Alert
 from app.services.ai_service import predict_ecg
 from app.services.risk_engine import calculate_chadsvasc
 from app.services.logging_service import log_action
+from app.services.email_service import send_alert_email_async
+from app.websocket.user_manager import user_manager
 
 # ─────────────────────────────────────────────────────────────────
 # Configuration
@@ -285,6 +290,76 @@ class MQTTService:
                 )
                 db.add(alert)
                 db.commit()
+                db.refresh(alert)
+
+                # 9b. Notification email au médecin propriétaire (non-bloquant, cooldown 5 min)
+                #     On récupère le médecin (User) et le patient (User via patient.user_id)
+                #     pour composer un email personnalisé.
+                doctor = db.query(User).filter(User.id == patient.doctor_id).first()
+                patient_user = (
+                    db.query(User).filter(User.id == patient.user_id).first()
+                    if patient.user_id else None
+                )
+
+                doctor_name = ""
+                patient_name = f"Patient #{patient_id}"
+
+                if doctor:
+                    doctor_name = f"{doctor.first_name} {doctor.last_name}"
+                if patient_user:
+                    patient_name = f"{patient_user.first_name} {patient_user.last_name}"
+
+                # Envoi email
+                if doctor and doctor.email:
+                    email_triggered = send_alert_email_async(
+                        doctor_email=doctor.email,
+                        doctor_name=doctor_name,
+                        patient_name=patient_name,
+                        patient_id=patient_id,
+                        alert_type=alert_type,
+                        severity=severity,
+                        predicted_class=ecg_result["predicted_class"],
+                        confidence=ecg_result["confidence"],
+                        risk_level=risk_data["risk_level"],
+                        chadsvasc_score=risk_data["chadsvasc_score"],
+                        message=alert.message,
+                    )
+
+                    # Marquer alert.email_sent si l'envoi a été déclenché
+                    # (True = envoyé à l'API Brevo, pas nécessairement délivré au médecin)
+                    if email_triggered:
+                        alert.email_sent = True
+                        db.commit()
+
+                # 9c. Push WebSocket au médecin (dashboard temps réel — cloche/toast/son)
+                #     MÊME événement que l'email : les deux partent atomiquement.
+                #     Si le médecin est connecté au WS /api/ws, sa cloche s'incrémente
+                #     + toast rouge + son. Sinon rien (silencieux normal — il aura l'email).
+                if doctor and self.loop:
+                    ws_payload = {
+                        "type": "alert",
+                        "alert_id": alert.id,
+                        "patient_id": patient_id,
+                        "patient_name": patient_name,
+                        "alert_type": alert_type,
+                        "severity": severity,
+                        "predicted_class": ecg_result["predicted_class"],
+                        "confidence": ecg_result["confidence"],
+                        "risk_level": risk_data["risk_level"],
+                        "chadsvasc_score": risk_data["chadsvasc_score"],
+                        "message": alert.message,
+                        "timestamp": datetime.utcnow().isoformat(),
+                    }
+                    asyncio.run_coroutine_threadsafe(
+                        user_manager.send_to_user(
+                            user_id=doctor.id,
+                            channel="notifications",
+                            data=ws_payload,
+                        ),
+                        self.loop,
+                    )
+                    print(f"[WS] Alerte pushée à user {doctor.id} "
+                          f"(patient {patient_id}, {severity})")
 
             # 10. Log système (le helper ne lève jamais d'exception)
             log_action(
@@ -308,7 +383,7 @@ class MQTTService:
                 + (" ⚠️ ALERTE" if needs_alert else "")
             )
 
-            # 11. Notification live au frontend du résultat d'analyse
+            # 11. Notification live au frontend du résultat d'analyse (channel ECG)
             if self.websocket_manager and self.loop:
                 asyncio.run_coroutine_threadsafe(
                     self.websocket_manager.send_ecg_data(patient_id, {

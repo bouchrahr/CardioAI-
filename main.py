@@ -13,6 +13,7 @@ from app.models import log, mri_scan, digital_twin, treatment_simulation, medica
 from app.routes import auth, users, patients, ecg, history, notifications
 from app.routes import digital_twin as digital_twin_router
 from app.routes import websocket
+from app.routes import ws_user                          # ← NOUVEAU
 from app.websocket.manager import manager
 from app.services.mqtt_service import mqtt_service
 from app.services.mri_service import mri_service
@@ -65,6 +66,7 @@ app.include_router(history.router)
 app.include_router(notifications.router)
 app.include_router(digital_twin_router.router)
 app.include_router(websocket.router)
+app.include_router(ws_user.router)                      # ← NOUVEAU
 app.include_router(logs_router.router)
 
 
