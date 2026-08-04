@@ -44,7 +44,8 @@ def calculate_chadsvasc(age, gender, has_diabetes, has_hypertension,
                          has_vascular_disease, previous_stroke,
                          ecg_class, ecg_probs=None,
                          spo2=98.0, tension_systolique=120.0,
-                         ef_percent=None):
+                         ef_percent=None,
+                         has_heart_failure=False):
     """
     CardioRisk Engine — CHADS-VASc ESC 2023 + modificateurs IoT
     """
@@ -56,7 +57,7 @@ def calculate_chadsvasc(age, gender, has_diabetes, has_hypertension,
 
     p = PatientRiskData(
         age=age, sexe=gender,
-        insuffisance_cardiaque=False,
+        insuffisance_cardiaque=has_heart_failure,
         hypertension=has_hypertension,
         diabete=has_diabetes,
         avc_precedent=previous_stroke,

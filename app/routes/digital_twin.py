@@ -18,9 +18,12 @@ import os
 import shutil
 from datetime import datetime
 from typing import List
-
+from fastapi.responses import FileResponse
+from app.services.twin_service import build_twin_state
 router = APIRouter(prefix="/api/cdt", tags=["Digital Twin"])
+from app.services.medication_service import simulate_medication, list_medications
 
+from app.models.treatment_simulation import TreatmentSimulation
 
 def get_db():
     db = SessionLocal()
@@ -338,3 +341,276 @@ def get_medical_notes(
         MedicalNote.patient_id == patient_id
     ).order_by(MedicalNote.created_at.desc()).all()
     return notes
+
+   # ─────────────────────────────────────────
+# ENDPOINT 7 — Lister tous les MRIScans d'un patient
+# ─────────────────────────────────────────
+
+@router.get("/mri/{patient_id}", response_model=List[MRIScanResponse])
+def list_patient_mri_scans(
+    patient_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_doctor)
+):
+    """
+    Retourne la liste de tous les MRIScans d'un patient (ED + ES confondus),
+    triés du plus récent au plus ancien.
+    """
+    patient = db.query(Patient).filter(
+        Patient.id == patient_id,
+        Patient.doctor_id == current_user.id
+    ).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient non trouvé")
+
+    scans = db.query(MRIScan).filter(
+        MRIScan.patient_id == patient_id
+    ).order_by(MRIScan.created_at.desc()).all()
+    return scans
+
+
+# ─────────────────────────────────────────
+# ENDPOINT 8 — Télécharger le masque de segmentation d'un MRIScan
+# ─────────────────────────────────────────
+
+@router.get("/mri/scan/{scan_id}/segmentation")
+def download_segmentation(
+    scan_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_doctor)
+):
+    """
+    Télécharge le masque de segmentation nnU-Net d'un MRIScan (fichier .nii.gz).
+    Le médecin doit être propriétaire du patient associé.
+    """
+    scan = db.query(MRIScan).filter(MRIScan.id == scan_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="MRIScan non trouvé")
+
+    # Vérifier que le scan appartient à un patient du médecin
+    patient = db.query(Patient).filter(
+        Patient.id == scan.patient_id,
+        Patient.doctor_id == current_user.id
+    ).first()
+    if not patient:
+        raise HTTPException(status_code=403, detail="Accès refusé à ce scan")
+
+    if not scan.segmentation_path or not os.path.exists(scan.segmentation_path):
+        raise HTTPException(
+            status_code=404,
+            detail="Aucun masque de segmentation disponible pour ce scan"
+        )
+
+    filename = f"scan_{scan_id}_{scan.frame_type or 'seg'}_segmentation.nii.gz"
+    return FileResponse(
+        path=scan.segmentation_path,
+        media_type="application/gzip",
+        filename=filename,
+    )
+# ─────────────────────────────────────────
+# ENDPOINT 9 — Refresh du Twin State (multi-modal)
+# ─────────────────────────────────────────
+
+
+
+
+@router.post("/refresh/{twin_id}")
+def refresh_twin_state(
+    twin_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_doctor)
+):
+    """
+    Reconstruit le twin_state en fusionnant :
+    - IRM (déjà présent)
+    - ECG dominant + confiance sur 24h
+    - Alertes récentes
+    - CHADS-VASc + facteurs de risque
+    - Score composite
+    Préserve l'historique (jusqu'à 20 snapshots).
+    """
+    twin = db.query(DigitalTwin).filter(
+        DigitalTwin.id == twin_id,
+        DigitalTwin.doctor_id == current_user.id
+    ).first()
+    if not twin:
+        raise HTTPException(status_code=404, detail="Digital Twin non trouvé")
+
+    try:
+        state = build_twin_state(twin_id, db)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur refresh : {e}")
+
+    return {
+        "twin_id": twin_id,
+        "refreshed_at": state["timestamp"],
+        "composite_risk_level": state["composite_risk_level"],
+        "state": state,
+    }
+
+   # ─────────────────────────────────────────
+# ENDPOINT 10 — Lister les médicaments simulables
+# ─────────────────────────────────────────
+
+
+
+@router.get("/medication/list")
+def get_medications(current_user=Depends(require_doctor)):
+    """Liste des médicaments simulables (pour dropdown UI)."""
+    return {"medications": list_medications()}
+
+
+# ─────────────────────────────────────────
+# ENDPOINT 11 — Simuler l'impact d'un médicament sur un twin
+# ─────────────────────────────────────────
+
+@router.post("/medication/simulate/{twin_id}")
+def simulate_medication_on_twin(
+    twin_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_doctor)
+):
+    """
+    Simule l'impact d'un médicament sur le twin actuel et PERSISTE le résultat.
+    Vérifie éligibilité (indications + contre-indications ESC 2023),
+    projette les effets attendus, cite les sources cliniques,
+    génère un rapport LLM, et sauvegarde tout dans TreatmentSimulation.
+
+    Body: {"medication_key": "beta_blocker"}
+    """
+    twin = db.query(DigitalTwin).filter(
+        DigitalTwin.id == twin_id,
+        DigitalTwin.doctor_id == current_user.id
+    ).first()
+    if not twin:
+        raise HTTPException(status_code=404, detail="Digital Twin non trouvé")
+
+    medication_key = payload.get("medication_key")
+    if not medication_key:
+        raise HTTPException(status_code=400, detail="Champ 'medication_key' requis")
+
+    if not twin.twin_state:
+        raise HTTPException(
+            status_code=400,
+            detail="twin_state vide. Lancez d'abord POST /api/cdt/refresh/{twin_id}."
+        )
+
+    try:
+        result = simulate_medication(medication_key, twin.twin_state)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # ─── PERSISTANCE ───
+    eligibility = result["eligibility"]
+    projection = result["projection"]
+    delta = projection.get("delta") or {}
+
+    # Mapping status
+    decision = eligibility["decision"]
+    if decision == "recommended":
+        status_str = "completed"
+    elif decision == "not_indicated":
+        status_str = "not_indicated"
+    else:
+        status_str = "contraindicated"
+
+    simulation = TreatmentSimulation(
+        digital_twin_id=twin_id,
+        doctor_id=current_user.id,
+        treatment_type=medication_key,
+        treatment_params=result["medication"],
+        # Contexte complet stocké dans simulated_ecg_30d (JSONB générique)
+        simulated_ecg_30d={
+            "eligibility": eligibility,
+            "projection": projection,
+            "sources": result["sources"],
+            "methodology_note": result["methodology_note"],
+        },
+        predicted_improvement=delta.get("ejection_fraction"),
+        avc_risk_reduction=delta.get("avc_risk_reduction_percent"),
+        side_effects_risk=None,  # non calculé dans cette version
+        llm_simulation_report=result.get("llm_report"),
+        status=status_str,
+    )
+    db.add(simulation)
+    db.commit()
+    db.refresh(simulation)
+
+    return {
+        "twin_id": twin_id,
+        "simulation_id": simulation.id,
+        "result": result,
+    }
+
+# ─────────────────────────────────────────
+# ENDPOINT 12 — Historique des simulations médicamenteuses
+# ─────────────────────────────────────────
+
+@router.get("/medication/history/{twin_id}")
+def get_medication_simulation_history(
+    twin_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_doctor)
+):
+    """
+    Retourne l'historique complet des simulations médicamenteuses pour un twin.
+    Triées du plus récent au plus ancien.
+    """
+    twin = db.query(DigitalTwin).filter(
+        DigitalTwin.id == twin_id,
+        DigitalTwin.doctor_id == current_user.id
+    ).first()
+    if not twin:
+        raise HTTPException(status_code=404, detail="Digital Twin non trouvé")
+
+    simulations = (
+        db.query(TreatmentSimulation)
+        .filter(TreatmentSimulation.digital_twin_id == twin_id)
+        .order_by(TreatmentSimulation.created_at.desc())
+        .all()
+    )
+
+    return {
+        "twin_id": twin_id,
+        "count": len(simulations),
+        "simulations": [
+            {
+                "id": s.id,
+                "treatment_type": s.treatment_type,
+                "medication": s.treatment_params,
+                "status": s.status,
+                "predicted_improvement": s.predicted_improvement,
+                "avc_risk_reduction": s.avc_risk_reduction,
+                "llm_report": s.llm_simulation_report,
+                "context": s.simulated_ecg_30d,
+                "created_at": s.created_at,
+            }
+            for s in simulations
+        ],
+    }
+
+
+# ─────────────────────────────────────────
+# ENDPOINT 13 — Supprimer une simulation
+# ─────────────────────────────────────────
+
+@router.delete("/medication/simulation/{simulation_id}")
+def delete_medication_simulation(
+    simulation_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_doctor)
+):
+    """Supprime une simulation médicamenteuse."""
+    simulation = db.query(TreatmentSimulation).filter(
+        TreatmentSimulation.id == simulation_id,
+        TreatmentSimulation.doctor_id == current_user.id
+    ).first()
+    if not simulation:
+        raise HTTPException(status_code=404, detail="Simulation non trouvée")
+
+    db.delete(simulation)
+    db.commit()
+    return {"deleted": True, "simulation_id": simulation_id}

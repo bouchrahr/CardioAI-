@@ -48,7 +48,7 @@ class DigitalTwin(Base):
 
     # Qualité de segmentation (confiance indicative, pas un vrai Dice sans GT)
     segmentation_meta = Column(JSONB, nullable=True)   # ex: {"ed_slices": 10, "es_slices": 10}
-
+    twin_state = Column(JSONB, nullable=True)
     # ── Champs avancés PRÉVUS MAIS NON IMPLÉMENTÉS ─────────────
     # Conservés pour compatibilité du schéma. Toujours NULL dans cette version.
     cdt_embedding = Column(JSONB, nullable=True)
