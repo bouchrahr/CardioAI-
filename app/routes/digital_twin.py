@@ -252,40 +252,6 @@ def get_latest_twin(
     return twin
 
 
-# ─────────────────────────────────────────
-# ENDPOINT 4 — Simuler un traitement (MOCK, inchangé)
-# ─────────────────────────────────────────
-
-@router.post("/simulate/{twin_id}", response_model=TreatmentSimulationResponse)
-def simulate_treatment(
-    twin_id: int,
-    data: TreatmentSimulationCreate,
-    db: Session = Depends(get_db),
-    current_user=Depends(require_doctor)
-):
-    twin = db.query(DigitalTwin).filter(
-        DigitalTwin.id == twin_id,
-        DigitalTwin.doctor_id == current_user.id
-    ).first()
-    if not twin:
-        raise HTTPException(status_code=404, detail="Digital Twin non trouvé")
-
-    simulation = TreatmentSimulation(
-        digital_twin_id=twin_id,
-        doctor_id=current_user.id,
-        treatment_type=data.treatment_type,
-        treatment_params=data.treatment_params,
-        status="completed",
-        predicted_improvement=72.5,
-        avc_risk_reduction=45.0,
-        side_effects_risk=12.3,
-        llm_simulation_report=f"Simulation du traitement '{data.treatment_type}' : résultats favorables attendus."
-    )
-    db.add(simulation)
-    db.commit()
-    db.refresh(simulation)
-    return simulation
-
 
 # ─────────────────────────────────────────
 # ENDPOINT 5 — Ajouter une note médicale
@@ -614,3 +580,60 @@ def delete_medication_simulation(
     db.delete(simulation)
     db.commit()
     return {"deleted": True, "simulation_id": simulation_id}
+
+   # ─────────────────────────────────────────
+# ENDPOINT 14 — Générer/récupérer le mesh 3D d'un scan
+# ─────────────────────────────────────────
+
+from fastapi.responses import Response
+from app.services.mesh_service import generate_heart_mesh
+
+
+@router.get("/mri/scan/{scan_id}/mesh")
+def get_scan_mesh(
+    scan_id: int,
+    force: bool = False,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_doctor)
+):
+    """
+    Génère (ou récupère depuis le cache) le mesh 3D GLB du cœur segmenté.
+    Le fichier GLB est destiné à un viewer Three.js côté frontend.
+
+    Query param `force=true` pour forcer la régénération.
+    Retourne : model/gltf-binary (fichier .glb)
+    """
+    scan = db.query(MRIScan).filter(MRIScan.id == scan_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="MRIScan non trouvé")
+
+    # Vérifier ownership
+    patient = db.query(Patient).filter(
+        Patient.id == scan.patient_id,
+        Patient.doctor_id == current_user.id
+    ).first()
+    if not patient:
+        raise HTTPException(status_code=403, detail="Accès refusé à ce scan")
+
+    if not scan.segmentation_path:
+        raise HTTPException(
+            status_code=404,
+            detail="Aucun masque de segmentation pour ce scan"
+        )
+
+    try:
+        glb_bytes = generate_heart_mesh(scan.segmentation_path, force=force)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur génération mesh : {e}")
+
+    return Response(
+        content=glb_bytes,
+        media_type="model/gltf-binary",
+        headers={
+            "Content-Disposition": f'inline; filename="heart_{scan_id}.glb"'
+        },
+    )

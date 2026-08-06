@@ -23,3 +23,5 @@ models/
 test_data/
 *.npy
 *.pth
+
+openapi_dump.txt
